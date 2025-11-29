@@ -1,53 +1,55 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import json
-import uuid
-from datetime import datetime
-from google.cloud import storage
-
-app = FastAPI()
-
-# ----------------------------
-# HABILITAR CORS PARA GEOIPT.CL
-# ----------------------------
-origins = [
-    "https://geoipt.cl",
-    "https://www.geoipt.cl",
-    "https://geocalculo.github.io",   # si usas preview en GitHub Pages
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 import os
 import json
 from datetime import datetime, timezone
 from uuid import uuid4
-from flask import Flask, request, jsonify
-from google.cloud import storage
-import smtplib
-from email.message import EmailMessage
 from io import StringIO
 import csv
+import smtplib
+from email.message import EmailMessage
 
+from flask import Flask, request, jsonify
+from google.cloud import storage
+
+# ======================================================
+# APP FLASK ÚNICA
+# ======================================================
 app = Flask(__name__)
 
-# === CONFIGURACIÓN vía variables de entorno ===
-LOGS_BUCKET = os.environ.get("LOGS_BUCKET")          # p.ej. "geoipt-logs"
-SMTP_USER   = os.environ.get("SMTP_USER")            # p.ej. "tucorreo@gmail.com"
-SMTP_PASS   = os.environ.get("SMTP_PASS")            # app password de Gmail
-SMTP_TO     = os.environ.get("SMTP_TO")              # "geocalculo@gmail.com"
+# ------------------------------------------------------
+# CONFIGURACIÓN (variables de entorno)
+# ------------------------------------------------------
+LOGS_BUCKET = os.environ.get("LOGS_BUCKET")  # p.ej. "geoipt-logs"
+
+SMTP_USER = os.environ.get("SMTP_USER")      # p.ej. "tucorreo@gmail.com"
+SMTP_PASS = os.environ.get("SMTP_PASS")      # app password Gmail
+SMTP_TO   = os.environ.get("SMTP_TO")        # p.ej. "geocalculo@gmail.com"
 
 storage_client = storage.Client()
 
+# Orígenes permitidos para CORS
+ALLOWED_ORIGINS = {
+    "https://geoipt.cl",
+    "https://www.geoipt.cl",
+    "https://geocalculo.github.io",  # si usas el sitio en GitHub Pages
+}
 
+# ------------------------------------------------------
+# CORS
+# ------------------------------------------------------
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+
+# ------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------
 def _get_bucket():
     if not LOGS_BUCKET:
         raise RuntimeError("LOGS_BUCKET no está configurado")
@@ -55,16 +57,23 @@ def _get_bucket():
 
 
 def _today_str():
-    # Usamos UTC para simplificar; si quieres, luego lo cambiamos a America/Santiago
+    # Usamos UTC para simplificar
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-@app.post("/api/log_evento")
+# ------------------------------------------------------
+# ENDPOINT: /api/log_evento
+# ------------------------------------------------------
+@app.route("/api/log_evento", methods=["POST", "OPTIONS"])
 def log_evento():
     """
     Guarda un evento individual en GCS como JSON.
     Se llamará desde index.html / info.html vía fetch().
     """
+    # Preflight CORS
+    if request.method == "OPTIONS":
+        return jsonify({}), 204
+
     try:
         data = request.get_json(force=True, silent=True) or {}
         tipo = data.get("tipo", "desconocido")
@@ -94,7 +103,10 @@ def log_evento():
 
         bucket = _get_bucket()
         blob = bucket.blob(blob_name)
-        blob.upload_from_string(json.dumps(evento), content_type="application/json")
+        blob.upload_from_string(
+            json.dumps(evento, ensure_ascii=False),
+            content_type="application/json",
+        )
 
         return jsonify({"ok": True}), 200
 
@@ -103,10 +115,11 @@ def log_evento():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+# ------------------------------------------------------
+# FUNCIONES PARA RESUMEN DIARIO
+# ------------------------------------------------------
 def _leer_eventos_fecha(fecha_str: str):
-    """
-    Lee todos los eventos de una fecha dada (AAAA-MM-DD) desde GCS.
-    """
+    """Lee todos los eventos de una fecha dada (AAAA-MM-DD) desde GCS."""
     bucket = _get_bucket()
     prefix = f"events/{fecha_str}/"
     blobs = bucket.list_blobs(prefix=prefix)
@@ -119,15 +132,15 @@ def _leer_eventos_fecha(fecha_str: str):
             eventos.append(evento)
         except Exception:
             continue
+
     return eventos
 
 
 def _construir_resumen_y_csv(eventos, fecha_str: str):
-    """
-    Construye un resumen simple y un CSV (como texto) desde la lista de eventos.
-    """
+    """Construye un resumen simple y un CSV (como texto) desde la lista de eventos."""
     total = len(eventos)
     por_tipo = {}
+
     for ev in eventos:
         t = ev.get("tipo", "desconocido")
         por_tipo[t] = por_tipo.get(t, 0) + 1
@@ -136,6 +149,7 @@ def _construir_resumen_y_csv(eventos, fecha_str: str):
     output = StringIO()
     writer = csv.writer(output, delimiter=";")
     writer.writerow(["fecha", "tipo", "ip", "detalle", "user_agent"])
+
     for ev in eventos:
         writer.writerow([
             ev.get("fecha", ""),
@@ -144,6 +158,7 @@ def _construir_resumen_y_csv(eventos, fecha_str: str):
             json.dumps(ev.get("detalle", {}), ensure_ascii=False),
             ev.get("user_agent", ""),
         ])
+
     csv_text = output.getvalue()
 
     resumen = {
@@ -151,13 +166,12 @@ def _construir_resumen_y_csv(eventos, fecha_str: str):
         "total_eventos": total,
         "por_tipo": por_tipo,
     }
+
     return resumen, csv_text
 
 
 def _enviar_correo_resumen(resumen, csv_text, fecha_str: str):
-    """
-    Envía un correo con el resumen y adjunta el CSV.
-    """
+    """Envía un correo con el resumen y adjunta el CSV."""
     if not (SMTP_USER and SMTP_PASS and SMTP_TO):
         # Si no hay configuración, solo salimos
         return
@@ -195,14 +209,16 @@ def _enviar_correo_resumen(resumen, csv_text, fecha_str: str):
         smtp.send_message(msg)
 
 
-@app.get("/api/resumen_diario")
+# ------------------------------------------------------
+# ENDPOINT: /api/resumen_diario (para Cloud Scheduler)
+# ------------------------------------------------------
+@app.route("/api/resumen_diario", methods=["GET"])
 def resumen_diario():
     """
     Endpoint que usará Cloud Scheduler.
     Parámetro opcional ?fecha=AAAA-MM-DD, si no -> hoy (UTC).
     """
     fecha_str = request.args.get("fecha") or _today_str()
-
     eventos = _leer_eventos_fecha(fecha_str)
     resumen, csv_text = _construir_resumen_y_csv(eventos, fecha_str)
 
@@ -215,6 +231,14 @@ def resumen_diario():
         resumen["email_error"] = str(e)
 
     return jsonify(resumen), 200
+
+
+# ------------------------------------------------------
+# ROOT SIMPLE (para probar desde el navegador)
+# ------------------------------------------------------
+@app.route("/", methods=["GET"])
+def root():
+    return "GeoIPT logs OK", 200
 
 
 # Para desarrollo local
