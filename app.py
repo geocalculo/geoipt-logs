@@ -1,3 +1,31 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import json
+import uuid
+from datetime import datetime
+from google.cloud import storage
+
+app = FastAPI()
+
+# ----------------------------
+# HABILITAR CORS PARA GEOIPT.CL
+# ----------------------------
+origins = [
+    "https://geoipt.cl",
+    "https://www.geoipt.cl",
+    "https://geocalculo.github.io",   # si usas preview en GitHub Pages
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 import os
 import json
 from datetime import datetime, timezone
